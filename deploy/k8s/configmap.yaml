@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datax-config
+  namespace: datax
+data:
+  NODE_ENV: "production"
+  HOST: "0.0.0.0"
+  PORT: "8080"
+  DATA_DIR: "/app/data"
+  # strict: 高危 SQL 必须 EXPLAIN 预查询 + 二次确认 | warn: 仅告警 | off: 关闭 AI
+  AUDIT_MODE: "strict"
+  AI_BASE_URL: "https://api.deepseek.com/v1"
+  AI_MODEL: "deepseek-chat"
+  JWT_EXPIRES_IN: "12h"

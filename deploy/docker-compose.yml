@@ -1,0 +1,63 @@
+services:
+  datax-server:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+      args:
+        # 内网镜像仓库场景可设置 DOCKER_REGISTRY / NODE_IMAGE / NGINX_IMAGE
+        REGISTRY: ${DOCKER_REGISTRY:-}
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}
+    image: datax-server:latest
+    container_name: datax-server
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATA_DIR: /app/data
+      # 生产环境必须显式配置；未设置时 Compose 会直接报错，避免带弱密钥启动
+      JWT_SECRET: ${JWT_SECRET:?请设置 JWT_SECRET，可参考 .env.example}
+      SECRET_KEY: ${SECRET_KEY:?请设置 SECRET_KEY，可参考 .env.example}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请设置 ADMIN_PASSWORD，可参考 .env.example}
+      # AI 安全审计（OpenAI 兼容接口，可留空使用内置规则引擎）
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-deepseek-chat}
+      AUDIT_MODE: ${AUDIT_MODE:-strict}
+    volumes:
+      - datax-data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/system/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    networks:
+      - datax-net
+
+  datax-web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        REGISTRY: ${DOCKER_REGISTRY:-}
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    image: datax-web:latest
+    container_name: datax-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      datax-server:
+        condition: service_healthy
+    networks:
+      - datax-net
+
+volumes:
+  datax-data:
+
+networks:
+  datax-net:
+    driver: bridge

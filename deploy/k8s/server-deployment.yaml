@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datax-server
+  namespace: datax
+  labels:
+    app: datax-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: datax-server
+  # SQLite + 进程内审计凭证要求严格单实例；升级时先停旧 Pod 再启动新 Pod
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: datax-server
+    spec:
+      containers:
+        - name: server
+          image: datax-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: datax-config
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: datax-secret
+                  key: JWT_SECRET
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: datax-secret
+                  key: SECRET_KEY
+            - name: ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: datax-secret
+                  key: ADMIN_USERNAME
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datax-secret
+                  key: ADMIN_PASSWORD
+            - name: AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: datax-secret
+                  key: AI_API_KEY
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /api/system/healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/system/healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: datax-data-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: datax-data-pvc
+  namespace: datax
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: datax-server
+  namespace: datax
+spec:
+  selector:
+    app: datax-server
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
