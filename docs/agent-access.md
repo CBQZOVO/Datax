@@ -144,11 +144,41 @@ search(ds, opts): Promise<EsSearchResult>
 | `q` | string 可选 | 关键词 → `match_phrase` 查 `qField` 字段（默认 `log`，日志场景 90% 是它） |
 | `qField` | string 可选 | 指定 `q` 检索的字段 |
 | `conditions` | array 可选 | 多条件过滤：每条 `{field, value}` 做 match_phrase，条件间 AND |
+| `query` | string 可选 | 键值检索语法（见下），与 `q`/`conditions` 互斥 |
 | `start` / `end` | string 可选 | ISO 8601 或 `yyyy-MM-dd`；**不带时区按 UTC 解释**（ES @timestamp 是 UTC，避免歧义）→ `range: { @timestamp: { gte, lt } }` |
 | `fields` | string[] 可选 | 返回哪些 _source 字段，默认 `["@timestamp", "log"]` |
 | `sort` | string 可选 | 默认 `@timestamp:desc` |
 | `size` | number 可选 | 默认 20，上限 1000 |
 | `lines` | boolean 可选 | 见下 |
+
+#### 键值检索语法（`query`）
+
+空格分隔的 token，token 之间为 AND；`-` 前缀表示排除（NOT）；`field:` 指定字段，裸词查 `qField`（默认 `log`）。
+
+| 语法 | 例子 | 语义 |
+|---|---|---|
+| `field:value` | `level:ERROR` | 该字段包含匹配（match_phrase） |
+| `-field:value` | `-thread:heartbeat` | 排除该字段匹配 |
+| 裸词 / `-裸词` | `timeout -heartbeat` | 查默认字段 / 排除 |
+| 通配 | `path:*timeout*`、`pod:api-*` | `*` 通配（前导通配须至少 2 个具体字符） |
+| 范围 | `status:>=500`、`cost:>100` | 数值范围（`>= <= > <`，操作符与值不加空格） |
+| 引号短语 | `message:"out of memory"` | value 含空格时用双引号包裹 |
+
+- `query` 与 `q`、`conditions` 互斥，同时传返回 400。
+- token 之间是 AND，暂不支持 OR/括号（保持解析简单可靠）。
+- 字段名仅允许字母数字 `_ . @ -`；值区分大小写（`level:error` 匹配不到 `ERROR`）。
+- 数值范围会尽量转数字传给 ES `range`；非数字则原样传字符串（可作用于日期等字段）。
+
+curl 示例：
+
+```bash
+# 查 ERROR 且 message 含超时、排除 heartbeat 线程、耗时 >=500ms
+curl -s -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"connectionId":2,"index":"logs-2026.10.*",
+       "query":"level:ERROR message:\"timeout\" -thread:heartbeat cost:>=500",
+       "size":50,"lines":true}' \
+  $BASE/api/es/search
+```
 
 ### 响应格式
 

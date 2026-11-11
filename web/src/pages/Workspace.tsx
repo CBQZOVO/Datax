@@ -97,6 +97,13 @@ interface EsCond {
   value: string;
 }
 
+/** 把「字段+值」条件行编译成键值检索语法 token：值含空格/引号/冒号或以 - 开头时用引号包裹（引号内 \" 转义） */
+function condToToken(cond: EsCond): string {
+  const v = cond.value;
+  const needsQuote = /\s|"|:/.test(v) || v.startsWith('-');
+  return needsQuote ? `${cond.field}:"${v.replace(/"/g, '\\"')}"` : `${cond.field}:${v}`;
+}
+
 /** ES 索引浏览面板：多条件（字段+包含值，AND）+ 时间范围快捷档 + 条数档位，按 @timestamp 倒序展示最新 N 条 */
 function EsQueryPanel({ tab }: { tab: Tab }) {
   const runEsSearch = useWorkspaceStore((s) => s.runEsSearch);
@@ -141,9 +148,10 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
   /** 组装搜索参数：显式传入的 fields/size/range 优先（setState 异步，不能依赖闭包里的新值），否则用自定义区间，最后回落时间快捷档 */
   const buildOpts = (extra: { fields?: string[]; size?: number; range?: [Dayjs, Dayjs] | null; presetStart?: string } = {}) => {
     const range = extra.range !== undefined ? extra.range : customRange;
+    const conds = activeConds();
     return {
       fields: extra.fields ?? selFields,
-      conditions: activeConds(),
+      query: conds.length ? conds.map(condToToken).join(' ') : undefined,
       size: extra.size ?? esSize,
       ...(range
         ? { start: range[0].toISOString(), end: range[1].toISOString() }
@@ -391,7 +399,7 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
             />
             <Input
               allowClear
-              placeholder="值（包含匹配）"
+              placeholder="值（支持 * 通配 / >=500 范围）"
               value={cond.value}
               onChange={(e) => patchCond(i, { value: e.target.value })}
               onPressEnter={() => void runEsSearch(tab.key, buildOpts())}

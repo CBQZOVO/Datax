@@ -1,4 +1,5 @@
 import { decryptSecret } from '../db/store.js';
+import { parseQuery } from './queryParser.js';
 import type { DataSource } from '../types.js';
 
 /**
@@ -18,6 +19,8 @@ export interface EsSearchOptions {
   qField?: string;
   /** 多条件过滤：每条 field 对 value 做包含匹配（match_phrase），条件间 AND */
   conditions?: { field: string; value: string }[];
+  /** 键值检索语法（field:value / -排除 / 范围 / 通配），与 q、conditions 互斥，由 queryParser 解析 */
+  query?: string;
   start?: string;
   end?: string;
   /** 时间范围字段名，默认 @timestamp（业务索引可用自己的时间字段） */
@@ -408,8 +411,10 @@ export class EsService {
     if (opts.start) assertTime(opts.start, 'start');
     if (opts.end) assertTime(opts.end, 'end');
 
-    const must: unknown[] = [];
-    const filter: unknown[] = [];
+    const fragment = opts.query ? parseQuery(opts.query, qField) : { must: [], must_not: [], filter: [] };
+    const must: unknown[] = [...fragment.must];
+    const must_not: unknown[] = [...fragment.must_not];
+    const filter: unknown[] = [...fragment.filter];
     if (opts.q !== undefined && opts.q.trim() !== '') {
       must.push({ match_phrase: { [qField]: opts.q } });
     }
@@ -433,8 +438,14 @@ export class EsService {
       size,
       sort: [sortClause],
       ...(fields ? { _source: fields } : {}),
-      query: must.length + filter.length > 0
-        ? { bool: { ...(must.length ? { must } : {}), ...(filter.length ? { filter } : {}) } }
+      query: must.length + filter.length + must_not.length > 0
+        ? {
+            bool: {
+              ...(must.length ? { must } : {}),
+              ...(filter.length ? { filter } : {}),
+              ...(must_not.length ? { must_not } : {}),
+            },
+          }
         : { match_all: {} },
     };
 

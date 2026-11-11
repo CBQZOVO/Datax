@@ -58,7 +58,7 @@ interface WorkspaceState {
   setActiveTab: (key: string) => void;
 
   runQuery: (tabKey: string, sql: string) => Promise<void>;
-  runEsSearch: (tabKey: string, opts?: { fields?: string[]; conditions?: { field: string; value: string }[]; start?: string; end?: string; size?: number }) => Promise<void>;
+  runEsSearch: (tabKey: string, opts?: { fields?: string[]; query?: string; start?: string; end?: string; size?: number }) => Promise<void>;
   runEsDsl: (tabKey: string, dslText: string) => Promise<void>;
   runRedisCommand: (tabKey: string, command: string) => Promise<void>;
   openAuditModal: (p: PendingAudit) => void;
@@ -170,7 +170,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 
-  /** ES 索引浏览：调 /api/es/search，按 @timestamp 倒序取最新 size（默认 100）条；fields 为空返回全部字段；conditions 多条件 AND */
+  /** ES 索引浏览：调 /api/es/search，按 @timestamp 倒序取最新 size（默认 100）条；fields 为空返回全部字段；query 为键值检索语法 */
   async runEsSearch(tabKey, opts) {
     const tab = get().tabs.find((item) => item.key === tabKey);
     if (!tab || tab.loading) return;
@@ -185,7 +185,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const { data } = await api.post('/es/search', {
         connectionId: tab.connectionId,
         index: tab.database,
-        conditions: opts?.conditions?.length ? opts.conditions : undefined,
+        query: opts?.query,
         start: opts?.start,
         end: opts?.end,
         fields: opts?.fields?.length ? opts.fields : undefined,

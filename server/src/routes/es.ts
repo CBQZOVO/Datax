@@ -12,20 +12,36 @@ const conditionSchema = z.object({
   value: z.string().min(1).max(500),
 });
 
-const searchSchema = z.object({
-  connectionId: z.number().int().positive(),
-  index: z.string().min(1).max(200),
-  q: z.string().max(500).optional(),
-  qField: z.string().max(100).regex(/^[\w.@-]+$/, '非法字段名').optional(),
-  conditions: z.array(conditionSchema).max(10).optional(),
-  start: z.string().max(64).optional(),
-  end: z.string().max(64).optional(),
-  timeField: z.string().max(100).regex(/^[\w.@-]+$/, '非法字段名').optional(),
-  fields: z.array(z.string().min(1).max(100)).max(20).optional(),
-  sort: z.string().max(200).optional(),
-  size: z.number().int().min(1).max(2000).optional(),
-  lines: z.boolean().optional().default(false),
-});
+const searchSchema = z
+  .object({
+    connectionId: z.number().int().positive(),
+    index: z.string().min(1).max(200),
+    q: z.string().max(500).optional(),
+    qField: z.string().max(100).regex(/^[\w.@-]+$/, '非法字段名').optional(),
+    conditions: z.array(conditionSchema).max(10).optional(),
+    /** 键值检索语法（field:value / -排除 / 范围 / 通配），与 q、conditions 互斥 */
+    query: z.string().max(2000).optional(),
+    start: z.string().max(64).optional(),
+    end: z.string().max(64).optional(),
+    timeField: z.string().max(100).regex(/^[\w.@-]+$/, '非法字段名').optional(),
+    fields: z.array(z.string().min(1).max(100)).max(20).optional(),
+    sort: z.string().max(200).optional(),
+    size: z.number().int().min(1).max(2000).optional(),
+    lines: z.boolean().optional().default(false),
+  })
+  .superRefine((data, ctx) => {
+    const hasQuery = data.query !== undefined && data.query.trim() !== '';
+    const hasLegacy =
+      (data.q !== undefined && data.q.trim() !== '') ||
+      (data.conditions !== undefined && data.conditions.length > 0);
+    if (hasQuery && hasLegacy) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['query'],
+        message: 'query 与 q/conditions 互斥，请二选一',
+      });
+    }
+  });
 
 const dslSchema = z.object({
   connectionId: z.number().int().positive(),
@@ -486,7 +502,7 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
   app.post('/search', async (req, reply) => {
     const parsed = searchSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: '参数错误', detail: parsed.error.issues });
-    const { connectionId, index, q, qField, conditions, start, end, timeField, fields, sort, size, lines } = parsed.data;
+    const { connectionId, index, q, qField, conditions, query, start, end, timeField, fields, sort, size, lines } = parsed.data;
 
     const got = getEsDataSource(req.user!, connectionId, reply);
     if (!got.ok) return;
@@ -499,7 +515,7 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
       username: user.username,
       connectionId,
       connectionName: got.ds.name,
-      sql: JSON.stringify({ index, q, conditions, start, end, timeField, size, fields }),
+      sql: JSON.stringify({ index, q, conditions, query, start, end, timeField, size, fields }),
       riskLevel: 'low' as const,
       rulesHit: '',
       aiSummary: 'es search',
@@ -509,7 +525,7 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
       result: '',
     };
     try {
-      const result = await esService().search(got.ds, { index, q, qField, conditions, start, end, timeField, fields, sort, size, lines });
+      const result = await esService().search(got.ds, { index, q, qField, conditions, query, start, end, timeField, fields, sort, size, lines });
       insertAuditLog({ ...logInput, elapsedMs: Date.now() - start0, result: `共匹配 ${result.total} 条 · 返回 ${result.hits.length} 行` });
       const format = (req.query as { format?: string }).format;
       if (format === 'csv' && result.lines) {
