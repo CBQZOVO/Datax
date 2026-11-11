@@ -40,6 +40,15 @@ export interface EsSearchResult {
 
 const INDEX_NAME_RE = /^[a-zA-Z0-9_.*-]+$/;
 const SORT_RE = /^[\w.@-]+:(asc|desc)$/i;
+/** ES6（typed 时代）创建索引时使用的默认单 type 名（6.x 单 type 限制；7+ 无 type 不用此值） */
+const ES6_DEFAULT_TYPE = 'doc';
+
+/** 校验为「具体索引名」（不允许通配 *），用于创建/删除索引、加字段等管理操作 */
+function assertConcreteIndex(index: string, action: string): void {
+  if (!INDEX_NAME_RE.test(index) || index.includes('*')) {
+    throw new Error(`${action}须指定具体索引名（不允许通配视图）`);
+  }
+}
 
 function baseUrl(ds: DataSource): string {
   // host 支持完整 baseURL（https://es.example.com）或纯主机名
@@ -58,7 +67,7 @@ async function esFetch(
   path: string,
   body?: unknown,
   timeoutMs = 30_000,
-  method?: 'GET' | 'POST' | 'DELETE'
+  method?: 'GET' | 'POST' | 'DELETE' | 'PUT'
 ): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -142,6 +151,94 @@ export class EsService {
     if (!res || typeof res !== 'object') {
       throw new Error('ES 响应异常：根路径未返回集群信息');
     }
+  }
+
+  /**
+   * 集群主版本号（6/7/8/9...）。
+   * 实时取、不缓存：编辑/删除是低频操作，多打一次极轻的 GET / 换取「连接指向改了也不残留旧版本」的确定性。
+   * 兼容口径：6.x 走 typed 端点，7/8/9 走 typeless 端点（7 起移除 type，8/9 与 7 在单文档 CRUD 上一致）。
+   */
+  async getMajorVersion(ds: DataSource): Promise<number> {
+    const res = (await esFetch(ds, '/')) as { version?: { number?: string } } | null;
+    return Number(String(res?.version?.number ?? '7').split('.')[0]) || 7;
+  }
+
+  /** ES6 及更早：从 mapping 取该索引的 type 名（6.x 单 type；7+ 无 type 返回 null） */
+  async getIndexType(ds: DataSource, index: string): Promise<string | null> {
+    if (!INDEX_NAME_RE.test(index)) throw new Error(`非法索引名：${index}`);
+    const res = (await esFetch(ds, `/${encodeURIComponent(index)}/_mapping`)) as Record<
+      string,
+      { mappings?: Record<string, unknown> }
+    >;
+    const mappings = Object.values(res ?? {})[0]?.mappings;
+    if (!mappings || typeof mappings !== 'object') return null;
+    // 排除 properties（ES7 格式）与 _default_/_meta 等元键
+    const type = Object.keys(mappings).find((k) => k !== 'properties' && !k.startsWith('_'));
+    return type ?? null;
+  }
+
+  /** 单文档端点：ES7/8/9 用 typeless /_doc/{id}，ES6 及更早用 /{index}/{type}/{id} */
+  private async docPath(ds: DataSource, index: string, id: string): Promise<string> {
+    const idx = encodeURIComponent(index);
+    const iid = encodeURIComponent(id);
+    const major = await this.getMajorVersion(ds);
+    if (major >= 7) return `/${idx}/_doc/${iid}`;
+    const type = await this.getIndexType(ds, index);
+    if (!type) throw new Error('该集群为 ES6 及更早版本，但索引缺少 type 映射，无法定位文档');
+    return `/${idx}/${encodeURIComponent(type)}/${iid}`;
+  }
+
+  /** 创建索引：PUT /{index}，可选 settings/mappings；ES6 自动把 typeless mappings 包成 typed（{type}: mappings） */
+  async createIndex(ds: DataSource, index: string, body?: { settings?: Record<string, unknown>; mappings?: Record<string, unknown> }): Promise<boolean> {
+    assertConcreteIndex(index, '创建索引');
+    const major = await this.getMajorVersion(ds);
+    const payload: Record<string, unknown> = {};
+    if (body?.settings && Object.keys(body.settings).length) payload.settings = body.settings;
+    if (body?.mappings && Object.keys(body.mappings).length) {
+      // 7+ typeless：{ mappings: { properties: ... } }；6 typed：{ mappings: { doc: { properties: ... } } }
+      payload.mappings = major >= 7 ? body.mappings : { [ES6_DEFAULT_TYPE]: body.mappings };
+    }
+    const res = (await esFetch(
+      ds, `/${encodeURIComponent(index)}`,
+      Object.keys(payload).length ? payload : undefined, 30_000, 'PUT'
+    )) as { acknowledged?: boolean } | null;
+    return res?.acknowledged === true;
+  }
+
+  /** 给已有索引加字段：ES7+ 用 PUT /{index}/_mapping；ES6 用 PUT /{index}/_mapping/{type}（type 从现有映射取） */
+  async putMapping(ds: DataSource, index: string, mappings: Record<string, unknown>): Promise<boolean> {
+    assertConcreteIndex(index, '更新映射');
+    const major = await this.getMajorVersion(ds);
+    let path = `/${encodeURIComponent(index)}/_mapping`;
+    if (major < 7) {
+      const type = await this.getIndexType(ds, index);
+      if (!type) throw new Error('该集群为 ES6 及更早版本，但索引缺少 type 映射，无法加字段');
+      path += `/${encodeURIComponent(type)}`;
+    }
+    const res = (await esFetch(ds, path, mappings, 30_000, 'PUT')) as { acknowledged?: boolean } | null;
+    return res?.acknowledged === true;
+  }
+
+  /** 删除索引：DELETE /{index}，不可恢复；index 须为具体索引名 */
+  async deleteIndex(ds: DataSource, index: string): Promise<boolean> {
+    assertConcreteIndex(index, '删除索引');
+    const res = (await esFetch(ds, `/${encodeURIComponent(index)}`, undefined, 30_000, 'DELETE')) as { acknowledged?: boolean } | null;
+    return res?.acknowledged === true;
+  }
+
+  /** 索引详情：完整 settings（展平）+ mapping 原文，供「查看结构」只读展示 */
+  async getIndexDetail(ds: DataSource, index: string): Promise<{ settings: Record<string, unknown>; mappings: Record<string, unknown> | null }> {
+    if (!INDEX_NAME_RE.test(index)) throw new Error(`非法索引名：${index}`);
+    const [settingsRes, mappingRes] = (await Promise.all([
+      esFetch(ds, `/${encodeURIComponent(index)}/_settings?flat_settings=true`),
+      esFetch(ds, `/${encodeURIComponent(index)}/_mapping`),
+    ])) as [
+      Record<string, { settings?: Record<string, unknown> }>,
+      Record<string, { mappings?: Record<string, unknown> }>,
+    ];
+    const settings = Object.values(settingsRes ?? {})[0]?.settings ?? {};
+    const mappings = Object.values(mappingRes ?? {})[0]?.mappings ?? null;
+    return { settings, mappings };
   }
 
   /** 索引列表（可选 pattern 前缀过滤） */
@@ -229,10 +326,50 @@ export class EsService {
       throw new Error('删除文档须指定具体索引（不允许通配视图）');
     }
     const res = (await esFetch(
-      ds, `/${encodeURIComponent(index)}/_doc/${encodeURIComponent(id)}`,
+      ds, await this.docPath(ds, index, id),
       undefined, 30_000, 'DELETE'
     )) as { result?: string };
     return res?.result === 'deleted' ? 1 : 0;
+  }
+
+  /** 按 _id 取文档原文（含 _source），文档不存在返回 null */
+  async getDocById(ds: DataSource, index: string, id: string): Promise<{ id: string; index: string; source: Record<string, unknown> } | null> {
+    if (!INDEX_NAME_RE.test(index) || index.includes('*')) {
+      throw new Error('须指定具体索引（不允许通配视图）');
+    }
+    try {
+      const res = (await esFetch(
+        ds, await this.docPath(ds, index, id),
+        undefined, 30_000, 'GET'
+      )) as { _id?: string; _index?: string; _source?: Record<string, unknown>; found?: boolean };
+      if (!res?.found || !res._source) return null;
+      return { id: String(res._id ?? id), index: String(res._index ?? index), source: res._source };
+    } catch (e) {
+      // ES 对不存在的文档返回 404
+      if ((e as Error).message.startsWith('ES 404')) return null;
+      throw e;
+    }
+  }
+
+  /** 按 _id 部分更新文档（_update + doc 合并写）；index 必须是具体索引（非通配视图） */
+  async updateById(ds: DataSource, index: string, id: string, doc: Record<string, unknown>): Promise<boolean> {
+    if (!INDEX_NAME_RE.test(index) || index.includes('*')) {
+      throw new Error('修改文档须指定具体索引（不允许通配视图）');
+    }
+    const idx = encodeURIComponent(index);
+    const iid = encodeURIComponent(id);
+    const major = await this.getMajorVersion(ds);
+    // ES6 及更早用 typed 端点 /{index}/{type}/{id}/_update
+    let path: string;
+    if (major >= 7) {
+      path = `/${idx}/_update/${iid}`;
+    } else {
+      const type = await this.getIndexType(ds, index);
+      if (!type) throw new Error('该集群为 ES6 及更早版本，但索引缺少 type 映射，无法更新文档');
+      path = `/${idx}/${encodeURIComponent(type)}/${iid}/_update`;
+    }
+    const res = (await esFetch(ds, path, { doc }, 30_000, 'POST')) as { result?: string };
+    return res?.result === 'updated';
   }
 
   /** 条件删除前预估匹配条数（_count，不产生变更） */

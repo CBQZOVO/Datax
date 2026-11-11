@@ -23,7 +23,9 @@ import {
   CopyOutlined,
   DatabaseOutlined,
   DeleteOutlined,
+  EditOutlined,
   PlusOutlined,
+  SettingOutlined,
   TableOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -34,6 +36,7 @@ import AuditConfirmModal from '../components/AuditConfirmModal';
 import AppHeader from '../components/AppHeader';
 import SqlEditor from '../components/SqlEditor';
 import ResultTable from '../components/ResultTable';
+import EsIndexManage from '../components/EsIndexManage';
 import { useWorkspaceStore, type Tab } from '../stores/workspace';
 import { useAuthStore } from '../stores/auth';
 import type { ColumnsType } from 'antd/es/table';
@@ -118,6 +121,16 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
   const [delBusy, setDelBusy] = useState(false);
   // 行详情（点击结果行）
   const [rowDetail, setRowDetail] = useState<Record<string, unknown> | null>(null);
+  // 按 _id 编辑文档（原文 JSON）
+  const [editOpen, setEditOpen] = useState(false);
+  const [editText, setEditText] = useState('');
+  const [editBusy, setEditBusy] = useState(false);
+  // 集群主版本号（写端点据此自适应，toolbar 展示）
+  const [esMajor, setEsMajor] = useState<number | null>(null);
+  // 索引管理弹窗
+  const [esManageOpen, setEsManageOpen] = useState(false);
+  // 字段列表重载信号（加字段后自增触发重新加载）
+  const [fieldsReload, setFieldsReload] = useState(0);
   // 自定义时间区间：选中后优先于快捷档，清空后回落快捷档
   const [customRange, setCustomRange] = useState<[Dayjs, Dayjs] | null>(null);
 
@@ -144,7 +157,7 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.key]);
 
-  // 索引切换后重新加载字段列表，并清空已选字段（空 = 显示全部字段）
+  // 索引切换后重新加载字段列表，并清空已选字段（空 = 显示全部字段）；加字段后由 fieldsReload 触发重载
   useEffect(() => {
     let active = true;
     api.get('/es/fields', { params: { connectionId: tab.connectionId, index: tab.database } })
@@ -159,7 +172,16 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
       })
       .catch(() => active && setAllFields([]));
     return () => { active = false; };
-  }, [tab.connectionId, tab.database]);
+  }, [tab.connectionId, tab.database, fieldsReload]);
+
+  // 拉取集群主版本号（toolbar 展示）
+  useEffect(() => {
+    let active = true;
+    api.get('/es/version', { params: { connectionId: tab.connectionId } })
+      .then(({ data }) => { if (active) setEsMajor((data.version as number) ?? null); })
+      .catch(() => active && setEsMajor(null));
+    return () => { active = false; };
+  }, [tab.connectionId]);
 
   /** 删除后按当前条件重新查询 */
   const reload = () => void runEsSearch(tab.key, buildOpts());
@@ -249,6 +271,70 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
     });
   };
 
+  /** 打开编辑：取文档原文（详情里展示的是展平视图，不能直接拿来回写） */
+  const openEdit = async () => {
+    const detail = rowDetail;
+    const id = typeof detail?.__id === 'string' ? detail.__id : null;
+    const index = typeof detail?.__index === 'string' ? detail.__index : null;
+    if (!id || !index) {
+      message.warning('该行缺少文档定位信息');
+      return;
+    }
+    setEditBusy(true);
+    try {
+      const { data } = await api.get('/es/doc', { params: { connectionId: tab.connectionId, index, id } });
+      if (!data.doc) {
+        message.warning('文档不存在（可能已被删除）');
+        return;
+      }
+      setEditText(JSON.stringify(data.doc.source, null, 2));
+      setEditOpen(true);
+    } catch (e) {
+      message.error(errMsg(e));
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  /** 保存编辑：doc 合并写（未提及字段保持原值），二次确认后提交 */
+  const saveEdit = () => {
+    const detail = rowDetail;
+    const id = typeof detail?.__id === 'string' ? detail.__id : null;
+    const index = typeof detail?.__index === 'string' ? detail.__index : null;
+    if (!id || !index) return;
+    let doc: unknown;
+    try {
+      doc = JSON.parse(editText);
+    } catch {
+      message.warning('JSON 格式错误');
+      return;
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+      message.warning('JSON 须为对象（字段 → 值）');
+      return;
+    }
+    modal.confirm({
+      title: '确认更新这条文档？',
+      content: `_id: ${id} · 索引: ${index}。按字段合并写入，未在 JSON 中出现的字段保持原值。`,
+      okText: '确认更新',
+      onOk: async () => {
+        setEditBusy(true);
+        try {
+          const { data } = await api.post('/es/update-by-id', { connectionId: tab.connectionId, index, id, doc });
+          message.success(data.updated ? '已更新' : '文档未变更');
+          setEditOpen(false);
+          setRowDetail(null);
+          reload();
+        } catch (e) {
+          message.error(errMsg(e));
+          return Promise.reject(e);
+        } finally {
+          setEditBusy(false);
+        }
+      },
+    });
+  };
+
   const patchCond = (i: number, patch: Partial<EsCond>) =>
     setConds((prev) => prev.map((c, ci) => (ci === i ? { ...c, ...patch } : c)));
 
@@ -259,8 +345,12 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
           <Tag color="blue" bordered={false}>elasticsearch</Tag>
           <Typography.Text strong>{tab.connectionName}</Typography.Text>
           <Typography.Text type="secondary">/ {tab.database}</Typography.Text>
+          {esMajor != null && <Tag bordered={false}>v{esMajor}.x</Tag>}
         </div>
         <Space size={8}>
+          {user?.role === 'admin' && (
+            <Button icon={<SettingOutlined />} onClick={() => setEsManageOpen(true)}>索引管理</Button>
+          )}
           {user?.role === 'admin' && (
             <Button
               danger
@@ -436,6 +526,9 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
         footer={
           <Space>
             {user?.role === 'admin' && rowDetail && (
+              <Button icon={<EditOutlined />} loading={editBusy} onClick={() => void openEdit()}>编辑文档</Button>
+            )}
+            {user?.role === 'admin' && rowDetail && (
               <Button danger icon={<DeleteOutlined />} onClick={() => deleteRow(rowDetail)}>删除此行</Button>
             )}
             <Button onClick={() => setRowDetail(null)}>关闭</Button>
@@ -457,6 +550,40 @@ function EsQueryPanel({ tab }: { tab: Tab }) {
           </>
         )}
       </Modal>
+
+      <Modal
+        title="编辑文档（按字段合并写）"
+        open={editOpen}
+        onCancel={() => setEditOpen(false)}
+        width={760}
+        footer={
+          <Space>
+            <Button onClick={() => setEditOpen(false)}>取消</Button>
+            <Button type="primary" loading={editBusy} onClick={saveEdit}>保存更新</Button>
+          </Space>
+        }
+      >
+        <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+          只提交下面 JSON 里出现的字段（部分更新），其余字段保持原值。保存前会再次确认。
+        </Typography.Text>
+        <Input.TextArea
+          value={editText}
+          onChange={(e) => setEditText(e.target.value)}
+          rows={16}
+          className="redis-key-detail__editor"
+        />
+      </Modal>
+
+      <EsIndexManage
+        connectionId={tab.connectionId}
+        defaultIndex={tab.database}
+        open={esManageOpen}
+        onClose={() => setEsManageOpen(false)}
+        onChanged={() => {
+          setFieldsReload((n) => n + 1);
+          reload();
+        }}
+      />
     </div>
   );
 }

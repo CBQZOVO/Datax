@@ -51,6 +51,35 @@ const deleteQuerySchema = z.object({
   maxDocs: z.number().int().min(1).max(10000).optional().default(1000),
 });
 
+/** 按 _id 部分更新：doc 为要合并的字段（非全量替换，未提及字段保持原值） */
+const updateByIdSchema = z.object({
+  connectionId: z.number().int().positive(),
+  index: z.string().min(1).max(200),
+  id: z.string().min(1).max(512),
+  doc: z.record(z.unknown()),
+});
+
+/** 创建索引：可选 settings / mappings（均为对象） */
+const createIndexSchema = z.object({
+  connectionId: z.number().int().positive(),
+  index: z.string().min(1).max(200),
+  settings: z.record(z.unknown()).optional(),
+  mappings: z.record(z.unknown()).optional(),
+});
+
+/** 给已有索引加字段：mappings 对象（仅新增字段） */
+const putMappingSchema = z.object({
+  connectionId: z.number().int().positive(),
+  index: z.string().min(1).max(200),
+  mappings: z.record(z.unknown()),
+});
+
+/** 删除索引：index 具体索引名 */
+const deleteIndexSchema = z.object({
+  connectionId: z.number().int().positive(),
+  index: z.string().min(1).max(200),
+});
+
 /** 递归检测 DSL 中是否含脚本执行字段（painless 沙箱历史上有逃逸风险，全员禁用） */
 function containsScript(node: unknown): boolean {
   if (Array.isArray(node)) return node.some(containsScript);
@@ -82,15 +111,15 @@ function buildDeleteDsl(field: string, value: string, start?: string, end?: stri
   };
 }
 
-/** ES 删除权限：仅管理员；agent 需写开关 + 白名单；且必须在授权视图范围内 */
-function assertDeletePermission(
+/** ES 写操作（删除/修改）权限：仅管理员；agent 需写开关 + 白名单；且必须在授权视图范围内 */
+function assertWritePermission(
   user: { id: number; role: 'admin' | 'user'; isAgent?: 0 | 1 },
   connectionId: number,
   index: string,
   reply: FastifyReply
 ): boolean {
   if (user.role !== 'admin' && !user.isAgent) {
-    reply.code(403).send({ error: '仅管理员可删除 ES 文档' });
+    reply.code(403).send({ error: '仅管理员可修改/删除 ES 文档' });
     return false;
   }
   if (user.isAgent) {
@@ -103,9 +132,10 @@ function assertDeletePermission(
   return checkIndexPermission(user, connectionId, index, reply);
 }
 
-function logEsDelete(
+function logEsWrite(
   user: { id: number; username: string; isAgent?: 0 | 1 },
   conn: { id: number; name: string },
+  aiSummary: string,
   sql: string,
   result: string
 ): void {
@@ -117,7 +147,7 @@ function logEsDelete(
     sql,
     riskLevel: 'high',
     rulesHit: '',
-    aiSummary: 'ES 文档删除',
+    aiSummary,
     decision: user.isAgent ? 'agent_write' : 'auto_allow',
     executed: 1,
     elapsedMs: 0,
@@ -200,6 +230,92 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
+  /** 集群版本：GET /api/es/version?connectionId=2（供前端展示，写端点据此自适应） */
+  app.get('/version', async (req, reply) => {
+    const { connectionId } = req.query as { connectionId?: string };
+    const id = Number(connectionId);
+    if (!Number.isInteger(id) || id <= 0) {
+      return reply.code(400).send({ error: '参数错误：connectionId 必填' });
+    }
+    const got = getEsDataSource(req.user!, id, reply);
+    if (!got.ok) return;
+    try {
+      return { version: await esService().getMajorVersion(got.ds) };
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+  });
+
+  /** 索引详情：GET /api/es/detail?connectionId&index（只读，完整 settings + mapping） */
+  app.get('/detail', async (req, reply) => {
+    const { connectionId, index } = req.query as { connectionId?: string; index?: string };
+    const id = Number(connectionId);
+    if (!Number.isInteger(id) || id <= 0 || !index) {
+      return reply.code(400).send({ error: '参数错误：connectionId 与 index 必填' });
+    }
+    const got = getEsDataSource(req.user!, id, reply);
+    if (!got.ok) return;
+    if (!checkIndexPermission(req.user!, id, index, reply)) return;
+    try {
+      return await esService().getIndexDetail(got.ds, index);
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+  });
+
+  /** 创建索引（可选 settings / mappings） */
+  app.post('/create-index', async (req, reply) => {
+    const parsed = createIndexSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: '参数错误：index 必填，settings/mappings 须为对象' });
+    const { connectionId, index, settings, mappings } = parsed.data;
+    const got = getEsDataSource(req.user!, connectionId, reply);
+    if (!got.ok) return;
+    if (!assertWritePermission(req.user!, connectionId, index, reply)) return;
+    try {
+      const created = await esService().createIndex(got.ds, index, { settings, mappings });
+      logEsWrite(req.user!, got.ds, 'ES 创建索引', `CREATE INDEX ${index}`, created ? '已创建' : '索引可能已存在');
+      return { created };
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+  });
+
+  /** 给已有索引加字段（仅新增字段，不改已有字段类型） */
+  app.post('/put-mapping', async (req, reply) => {
+    const parsed = putMappingSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: '参数错误：mappings 须为对象' });
+    const { connectionId, index, mappings } = parsed.data;
+    const got = getEsDataSource(req.user!, connectionId, reply);
+    if (!got.ok) return;
+    if (!assertWritePermission(req.user!, connectionId, index, reply)) return;
+    try {
+      const updated = await esService().putMapping(got.ds, index, mappings);
+      logEsWrite(req.user!, got.ds, 'ES 更新映射', `PUT MAPPING ${index}`, updated ? '已更新' : '无变化');
+      return { updated };
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+  });
+
+  /** 删除索引（不可恢复，仅管理员；前端二次确认 + 输入索引名） */
+  app.post('/delete-index', async (req, reply) => {
+    const parsed = deleteIndexSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: '参数错误：index 必填' });
+    const { connectionId, index } = parsed.data;
+    const got = getEsDataSource(req.user!, connectionId, reply);
+    if (!got.ok) return;
+    if (req.user!.role !== 'admin') {
+      return reply.code(403).send({ error: '仅管理员可删除索引' });
+    }
+    try {
+      const deleted = await esService().deleteIndex(got.ds, index);
+      logEsWrite(req.user!, got.ds, 'ES 删除索引', `DROP INDEX ${index}`, deleted ? '已删除' : '索引不存在');
+      return { deleted };
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+  });
+
   /** 字段列表：GET /api/es/fields?connectionId=2&index=xxx（mapping 展平后的字段点路径） */
   app.get('/fields', async (req, reply) => {
     const { connectionId, index } = req.query as { connectionId?: string; index?: string };
@@ -217,6 +333,41 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
+  /** 按 _id 取文档原文（读权限即可，供编辑前回显） */
+  app.get('/doc', async (req, reply) => {
+    const { connectionId, index, id } = req.query as { connectionId?: string; index?: string; id?: string };
+    const cid = Number(connectionId);
+    if (!Number.isInteger(cid) || cid <= 0 || !index || !id) {
+      return reply.code(400).send({ error: '参数错误：connectionId / index / id 必填' });
+    }
+    const got = getEsDataSource(req.user!, cid, reply);
+    if (!got.ok) return;
+    if (!checkIndexPermission(req.user!, cid, index, reply)) return;
+    try {
+      const doc = await esService().getDocById(got.ds, index, id);
+      return { doc };
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+  });
+
+  /** 按 _id 部分更新文档（doc 合并写，未提及字段保持原值）；权限与删除同闸 */
+  app.post('/update-by-id', async (req, reply) => {
+    const parsed = updateByIdSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: '参数错误：doc 须为字段对象' });
+    const { connectionId, index, id, doc } = parsed.data;
+    const got = getEsDataSource(req.user!, connectionId, reply);
+    if (!got.ok) return;
+    if (!assertWritePermission(req.user!, connectionId, index, reply)) return;
+    try {
+      const updated = await esService().updateById(got.ds, index, id, doc);
+      logEsWrite(req.user!, got.ds, 'ES 文档更新', `UPDATE ${index}/${id} ${JSON.stringify(doc).slice(0, 2000)}`, updated ? '已更新 1 条' : '文档未变更');
+      return { updated };
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message });
+    }
+  });
+
   /** 按 _id 删除单条文档（index 须为具体索引） */
   app.post('/delete-by-id', async (req, reply) => {
     const parsed = deleteByIdSchema.safeParse(req.body);
@@ -224,10 +375,10 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
     const { connectionId, index, id } = parsed.data;
     const got = getEsDataSource(req.user!, connectionId, reply);
     if (!got.ok) return;
-    if (!assertDeletePermission(req.user!, connectionId, index, reply)) return;
+    if (!assertWritePermission(req.user!, connectionId, index, reply)) return;
     try {
       const deleted = await esService().deleteById(got.ds, index, id);
-      logEsDelete(req.user!, got.ds, `DELETE BY ID ${index}/${id}`, deleted > 0 ? '已删除 1 条' : '文档不存在');
+      logEsWrite(req.user!, got.ds, 'ES 文档删除', `DELETE BY ID ${index}/${id}`, deleted > 0 ? '已删除 1 条' : '文档不存在');
       return { deleted };
     } catch (e) {
       return reply.code(400).send({ error: (e as Error).message });
@@ -241,7 +392,7 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
     const { connectionId, index, field, value, start, end } = parsed.data;
     const got = getEsDataSource(req.user!, connectionId, reply);
     if (!got.ok) return;
-    if (!assertDeletePermission(req.user!, connectionId, index, reply)) return;
+    if (!assertWritePermission(req.user!, connectionId, index, reply)) return;
     try {
       const count = await esService().countByQuery(got.ds, index, buildDeleteDsl(field, value, start, end));
       return { count };
@@ -257,7 +408,7 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
     const { connectionId, index, field, value, start, end, maxDocs } = parsed.data;
     const got = getEsDataSource(req.user!, connectionId, reply);
     if (!got.ok) return;
-    if (!assertDeletePermission(req.user!, connectionId, index, reply)) return;
+    if (!assertWritePermission(req.user!, connectionId, index, reply)) return;
     try {
       const dsl = buildDeleteDsl(field, value, start, end);
       const count = await esService().countByQuery(got.ds, index, dsl);
@@ -265,7 +416,7 @@ export async function esRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send({ error: `匹配 ${count} 条，超过单次上限 ${maxDocs}，请缩小条件或调大上限` });
       }
       const deleted = await esService().deleteByQuery(got.ds, index, dsl, maxDocs);
-      logEsDelete(req.user!, got.ds, `DELETE BY QUERY ${index} WHERE ${field} LIKE ${value}`, `已删除 ${deleted} 条`);
+      logEsWrite(req.user!, got.ds, 'ES 文档删除', `DELETE BY QUERY ${index} WHERE ${field} LIKE ${value}`, `已删除 ${deleted} 条`);
       return { deleted };
     } catch (e) {
       return reply.code(400).send({ error: (e as Error).message });

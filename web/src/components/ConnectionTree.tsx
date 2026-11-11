@@ -66,7 +66,7 @@ export default function ConnectionTree({
   onDeleteConnection,
 }: ConnTreeProps) {
   const { message } = App.useApp();
-  const { connections, loadConnections, loadingConnections } = useWorkspaceStore();
+  const { connections, loadConnections, loadingConnections, treeRefreshNonce } = useWorkspaceStore();
   const [filter, setFilter] = useState('');
   const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([]);
   const [treeData, setTreeData] = useState<MetaNode[]>([]);
@@ -78,6 +78,19 @@ export default function ConnectionTree({
   useEffect(() => {
     void loadConnections();
   }, [loadConnections]);
+
+  // 数据源树刷新：ES 建/删索引后清空已加载子节点缓存并重新加载，跳过首次挂载
+  const firstTreeRun = useRef(true);
+  useEffect(() => {
+    if (firstTreeRun.current) {
+      firstTreeRun.current = false;
+      return;
+    }
+    loadedKeysRef.current.clear();
+    setExpandedKeys([]);
+    void loadConnections();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [treeRefreshNonce]);
 
   // 连接列表变化时重建根节点，但保留已加载的子节点，避免展开状态丢失
   useEffect(() => {

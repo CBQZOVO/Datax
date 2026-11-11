@@ -47,6 +47,10 @@ interface WorkspaceState {
   explainLoading: boolean;
   confirming: boolean;
 
+  // 数据源树刷新信号（ES 建索引/删索引后自增，触发树重载）
+  treeRefreshNonce: number;
+  refreshTree: () => void;
+
   loadConnections: () => Promise<void>;
   addTab: (tab: Omit<Tab, 'key' | 'requestId' | 'result' | 'loading' | 'error'>) => string;
   updateTab: (key: string, patch: Partial<Tab>) => void;
@@ -76,6 +80,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   explain: null,
   explainLoading: false,
   confirming: false,
+  treeRefreshNonce: 0,
+
+  refreshTree() {
+    set((s) => ({ treeRefreshNonce: s.treeRefreshNonce + 1 }));
+  },
 
   async loadConnections() {
     set({ loadingConnections: true });

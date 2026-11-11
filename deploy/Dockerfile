@@ -3,8 +3,8 @@
 #   docker build --platform linux/amd64 -f deploy/Dockerfile -t <tag> .
 # 说明：指定的 nginx 镜像为 debian 基础（glibc），构建阶段必须用 glibc 系 node
 # 镜像（bookworm-slim），否则 better-sqlite3 原生模块的 ABI 与运行时不匹配。
-ARG NODE_IMAGE=library/node:20
-ARG NGINX_IMAGE=library/nginx:1.31.5
+ARG NODE_IMAGE=registry.inspures.com/public/docker.io/library/node:22
+ARG NGINX_IMAGE=registry.inspures.com/public/docker.io/library/nginx:1.30.0
 
 # ===== 前端构建 =====
 FROM ${NODE_IMAGE} AS web-builder
